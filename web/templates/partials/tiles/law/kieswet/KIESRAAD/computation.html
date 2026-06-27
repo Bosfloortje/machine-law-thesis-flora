@@ -1,0 +1,16 @@
+<div>
+    <h4 class="text-sm font-medium text-gray-500 mb-1">
+        Voor de verkiezingen van <strong>{{ input['$VERKIEZINGSDATUM']|format_date }}</strong> heeft u
+    </h4>
+    <div class="flex items-baseline space-x-2">
+        {% if result.heeft_stemrecht %}
+            <p class="text-4xl font-bold text-pink-600 mt-2">STEMRECHT</p>
+        {% else %}
+            <p class="text-4xl font-bold text-pink-600 mt-2">GEEN stemrecht</p>
+        {% endif %}
+        <button onclick="openExplanationChat('{{ service }}', '{{ law }}', '{{ effective_bsn|default(bsn) }}', '{{ rule_spec.name|default(law)|e }}')"
+                class="ml-4 text-sm text-gray-400 hover:text-gray-900 border-b border-dotted border-gray-300 hover:border-gray-600 cursor-pointer">
+            waarom?
+        </button>
+    </div>
+</div>

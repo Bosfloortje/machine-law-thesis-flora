@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="nl">
+    <head>
+        <title>
+            {% block title %}Zaaksysteem{% endblock %}
+        </title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+        <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+        <link rel="icon"
+              type="image/png"
+              href="/static/img/favicon-96x96.png"
+              sizes="96x96" />
+        <link rel="icon" type="image/svg+xml" href="/static/img/favicon.svg" />
+        <link rel="shortcut icon" href="/static/img/favicon.ico" />
+        <link rel="apple-touch-icon"
+              sizes="180x180"
+              href="/static/img/apple-touch-icon.png" />
+        <link rel="manifest" href="/static/img/site.webmanifest" />
+        <style>
+        .htmx-swapping {
+            opacity: 0;
+            transition: opacity 0.5s ease-out;
+        }
+
+        .htmx-settling {
+            opacity: 1;
+            transition: opacity 0.5s ease-in;
+        }
+
+        .dragging {
+            opacity: 0.5;
+        }
+
+        .sortable-ghost {
+            opacity: 0.5;
+            background: #f8fafc;
+        }
+
+        .sortable-drag {
+            background: white;
+        }
+
+        .lane {
+            min-height: 100px;
+        }
+
+        .htmx-indicator {
+            display: none;
+        }
+
+        .htmx-request .htmx-indicator {
+            display: inline;
+        }
+        </style>
+    </head>
+    <body class="bg-gray-50">
+        {% block content %}{% endblock %}
+        <script>
+    document.addEventListener('DOMContentLoaded', function () {
+        // Initialize Sortable on all lanes
+        document.querySelectorAll('.lane').forEach(function (lane) {
+            new Sortable(lane, {
+                group: 'claims',
+                animation: 150,
+                draggable: 'form',  // Make the form draggable
+                onEnd: function (evt) {
+                    const form = evt.item;  // The form is now the dragged item
+                    const newStatus = evt.to.getAttribute('data-status');
+                    const statusInput = form.querySelector('input[name="new_status"]');
+                    if (statusInput && newStatus) {
+                        statusInput.value = newStatus;
+                        htmx.trigger(form, 'submit');
+                    }
+                }
+            });
+        });
+    });
+        </script>
+        <script>
+        // Listen for Ctrl-R / Cmd-R when inside iframe and notify parent
+        document.addEventListener('keydown', (e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'r') {
+                // Check if we're inside an iframe
+                if (window !== window.parent) {
+                    e.preventDefault(); // Prevent full page refresh
+                    window.parent.postMessage({ type: 'refresh-iframe' }, window.location.origin);
+                    console.log('Sent refresh-iframe message to parent');
+                }
+                // If not in iframe, allow normal browser refresh
+            }
+        });
+        </script>
+    </body>
+</html>

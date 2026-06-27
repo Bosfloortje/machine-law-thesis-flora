@@ -1,0 +1,89 @@
+[project]
+name = "poc-machine-law"
+version = "1.12.2"
+description = "Proof of Concept - Machine Law"
+readme = "README.md"
+requires-python = ">=3.12.0,<3.14"
+dependencies = [
+    "aiohttp>=3.11.16",
+    "anthropic>=0.45.2",
+    "behave>=1.2.6,<1.3",
+    "bs4>=0.0.2",
+    "eventsourcing>=9.3.5",
+    "fastapi>=0.115.8",
+    "fastmcp>=2.12.3",
+    "httpx>=0.28.1",
+    "itsdangerous>=2.2.0",
+    "jinja2>=3.1.5",
+    "jsonschema>=4.23.0",
+    "langchain>=0.3.23",
+    "langchain-anthropic>=0.3.7",
+    "langchain-community>=0.3.20",
+    "langchain-mcp-adapters>=0.1.9",
+    "langgraph>=0.3.18",
+    "markdown>=3.7",
+    "mcp>=1.14.0",
+    "nest-asyncio>=1.6.0",
+    "ollama>=0.6.2",
+    "openai>=1.76.2",
+    "openapi-python-client>=0.24.3",
+    "openpyxl>=3.1.5",
+    "pandas>=2.2.3",
+    "pillow>=11.3.0",
+    "python-multipart>=0.0.20",
+    "pyyaml>=6.0.2",
+    "requests>=2.32.3",
+    "scikit-learn>=1.8.0",
+    "tavily-python>=0.5.1",
+    "textstat>=0.7.13",
+    "torch>=2.11.0",
+    "tqdm>=4.67.1",
+    "transformers>=5.5.4",
+    "uvicorn>=0.40.0",
+    "websockets>=15.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-playwright>=0.4.0",
+    "playwright>=1.40.0",
+    "ruff>=0.11.0",
+    "openapi-python-client>=0.24.3",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+exclude = ["features/steps/steps.py", "script", "wallet"]
+
+[tool.ruff.format]
+line-ending = "lf"
+
+[tool.ruff.lint]
+select = ["I", "SIM", "UP", "F", "LOG", "PIE", "PT", "W"]
+fixable = ["ALL"]
+task-tags = ["TODO"]
+ignore = ["TRY003", "SIM105"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+branch = "main"
+build_command = ""
+commit_message = "chore(release): {version}"
+tag_format = "v{version}"
+
+[tool.semantic_release.commit_parser_options]
+allowed_tags = ["build", "chore", "ci", "docs", "feat", "fix", "perf", "style", "refactor", "test"]
+minor_tags = ["feat"]
+patch_tags = ["fix", "perf"]
+
+[tool.semantic_release.remote]
+type = "github"
+
+[tool.semantic_release.publish]
+upload_to_vcs_release = false

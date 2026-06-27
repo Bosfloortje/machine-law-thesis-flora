@@ -1,0 +1,19 @@
+<div>
+    {% if result.is_gerechtigd %}
+        <h4 class="text-sm font-medium text-gray-600 mb-2">Uw huurtoeslag is waarschijnlijk</h4>
+        <div class="flex items-baseline">
+            <span class="text-4xl font-bold text-indigo-600">{{ (result.subsidiebedrag / 100) | format_currency }}</span>
+            <span class="ml-2 text-gray-600">per maand</span>
+            <button onclick="openExplanationChat('{{ service }}', '{{ law }}', '{{ effective_bsn|default(bsn) }}', '{{ rule_spec.name|default(law)|e }}')"
+                    class="ml-4 text-sm text-gray-400 hover:text-gray-900 border-b border-dotted border-gray-300 hover:border-gray-600 cursor-pointer">
+                waarom?
+            </button>
+        </div>
+    {% elif missing_required %}
+        <h4 class="text-sm font-medium text-gray-500 mb-1">
+            Om te weten of u in aanmerking komt zijn extra gegevens nodig. Die kunt u hier aanleveren.
+        </h4>
+    {% else %}
+        <h4 class="text-sm font-medium text-gray-500 mb-1">U krijgt waarschijnlijk geen huurtoeslag.</h4>
+    {% endif %}
+</div>

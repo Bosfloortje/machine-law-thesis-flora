@@ -1,0 +1,975 @@
+import asyncio
+import json
+import re
+import sys
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, Form, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, Response
+
+from explain.graphrag_context import GRAPHRAG_SYSTEM_PROMPT, build_graph_context, build_graph_html
+
+# Lazy-load contestability from analysis scripts (same pattern as graphrag_context.py)
+_EVALUATION_DIR = Path(__file__).parent.parent.parent / "analysis" / "llm_explanations" / "scripts" / "evaluation"
+if str(_EVALUATION_DIR) not in sys.path:
+    sys.path.insert(0, str(_EVALUATION_DIR))
+from explain.contestability import contestability_score
+from explain.llm_factory import LLMFactory
+from explain.llm_guard import REDIRECT_MESSAGE, validate_response
+from explain.mcp_connector import MCPLawConnector
+from web.demo_profiles import get_demo_bsn
+from web.dependencies import (
+    TODAY,
+    get_case_manager,
+    get_claim_manager,
+    get_engine_id,
+    get_machine_service,
+    templates,
+)
+from web.engines import CaseManagerInterface, ClaimManagerInterface, EngineInterface
+from web.engines.http_engine.machine_client.regel_recht_engine_api_client.errors import UnexpectedStatus
+from web.feature_flags import is_auto_approve_claims_enabled, is_chat_enabled
+from web.utils import format_message
+
+router = APIRouter(prefix="/chat", tags=["chat"])
+
+connections: dict[str, list[WebSocket]] = {}
+
+
+class ChatConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[str, WebSocket] = {}
+
+    async def connect(self, websocket: WebSocket, client_id: str):
+        await websocket.accept()
+        self.active_connections[client_id] = websocket
+
+    def disconnect(self, client_id: str):
+        if client_id in self.active_connections:
+            del self.active_connections[client_id]
+
+    async def send_message(self, message: str, client_id: str):
+        if client_id in self.active_connections:
+            await self.active_connections[client_id].send_text(message)
+
+
+async def handle_application_display(
+    websocket: WebSocket,
+    bsn: str,
+    services,
+    case_manager,
+    claim_manager,
+    mcp_connector,
+    service_results,
+    messages,
+    user_msg_content,
+    templates,
+    lang: str = "nl",
+):
+    """Display an application panel in the chat interface."""
+    from web.routers.laws import evaluate_law
+
+    try:
+        # Parse the message to identify service and law
+        msg = user_msg_content.lower()
+        registry_service_name = None  # This is the service name in the registry (e.g. "zorgtoeslag")
+        service = None  # This is the service type (e.g. "TOESLAGEN")
+        law = None  # This is the law path (e.g. "zorgtoeslagwet")
+
+        # First try to use the service name directly from application_form reference
+        if "application_form" in service_results:
+            registry_service_name = service_results["application_form"]["service"]
+
+            # Get the service details from the registry
+            service_obj = mcp_connector.registry.get_service(registry_service_name)
+            if service_obj:
+                service = service_obj.service_type
+                law = service_obj.law_path
+
+        # If not found yet, try to identify from other service results
+        if not service or not law:
+            # Filter out the application_form entry if it exists
+            filtered_results = {k: v for k, v in service_results.items() if k != "application_form"}
+
+            if filtered_results and len(filtered_results) > 0:
+                result_service_name = list(filtered_results.keys())[0]
+                service_obj = mcp_connector.registry.get_service(result_service_name)
+                if service_obj:
+                    registry_service_name = result_service_name
+                    service = service_obj.service_type
+                    law = service_obj.law_path
+
+        # Last resort: search for all service names in the message
+        if not service or not law:
+            # Get all service names from the registry
+            all_service_names = mcp_connector.registry.get_service_names()
+
+            # Find service names that appear in the message
+            for name in all_service_names:
+                if name.lower() in msg:
+                    service_obj = mcp_connector.registry.get_service(name)
+                    if service_obj:
+                        registry_service_name = name
+                        service = service_obj.service_type
+                        law = service_obj.law_path
+                        break
+
+        if service and law:
+            # Get data for the application panel - explicitly use approved=False to include unapproved claims
+            law, result, parameters = evaluate_law(bsn, law, service, services, approved=False)
+
+            # Get the rule spec separately
+            rule_spec = services.get_rule_spec(law, TODAY, service)
+
+            # Use the service's extract_value_tree method, which now should be properly set up
+            value_tree = services.extract_value_tree(result.path)
+
+            # Get claims for this user
+            claims = claim_manager.get_claims_by_bsn(bsn, include_rejected=True)
+            claim_map = {(claim.service, claim.law, claim.key): claim for claim in claims}
+
+            # Get existing case if any
+            existing_case = case_manager.get_case(bsn, service, law)
+
+            # Render the application panel template with in_chat_panel=True
+            panel_html = templates.get_template("partials/tiles/components/application_form.html").render(
+                request=None,
+                service=service,
+                law=law,
+                rule_spec=rule_spec,
+                input=result.input,
+                result=result.output,
+                requirements_met=result.requirements_met,
+                path=value_tree,
+                bsn=bsn,
+                current_case=existing_case,
+                claim_map=claim_map,
+                missing_required=result.missing_required,
+                in_chat_panel=True,
+                registry_service_name=registry_service_name,  # Pass the registry service name for submission
+                current_engine_id=get_engine_id(),
+            )
+
+            # Send the application panel to the client
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "applicationPanel": True,
+                        "html": panel_html,
+                        "service": registry_service_name,  # Send the registry service name
+                        "law": law,
+                        "bsn": bsn,
+                    }
+                )
+            )
+
+            # Don't add anything to the conversation history when showing application panel
+            # Since the form is shown after the LLM response, we don't need to track it in the conversation
+
+            return True
+        else:
+            # No service/law identified, send message asking for more info
+            # Include the available service names in the message to help the user
+            available_services = mcp_connector.registry.get_service_names()
+            service_list = ", ".join([s for s in available_services])
+
+            if lang == "en":
+                error_msg = (
+                    "I cannot find a specific regulation to show an application form for. "
+                    "Could you indicate for which of the following regulations you want to apply?\n\n"
+                    f"Available regulations: {service_list}"
+                )
+            else:
+                error_msg = (
+                    "Ik kan geen specifieke regeling vinden om een aanvraagformulier voor te tonen. "
+                    "Kunt u aangeven voor welke van de volgende regelingen u een aanvraag wilt doen?\n\n"
+                    f"Beschikbare regelingen: {service_list}"
+                )
+            html_message = format_message(error_msg)
+            await websocket.send_text(json.dumps({"message": error_msg, "html": str(html_message)}))
+
+            # Add messages to conversation
+            messages.append({"role": "user", "content": user_msg_content})
+            messages.append({"role": "assistant", "content": error_msg})
+
+            return True
+
+    except Exception as e:
+        print(f"Error showing application panel: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
+
+        # Send error message as a system message
+        error_msg = (
+            "An error occurred while displaying the application form. Please try again later."
+            if lang == "en"
+            else "Er is een fout opgetreden bij het tonen van het aanvraagformulier. Probeer het later opnieuw."
+        )
+        html_message = format_message(error_msg)
+        await websocket.send_text(
+            json.dumps({"message": error_msg, "html": str(html_message), "isSystemMessage": True})
+        )
+
+        # Add messages to conversation
+        messages.append({"role": "user", "content": user_msg_content})
+        messages.append({"role": "assistant", "content": error_msg})
+
+        return True
+
+
+async def handle_application_submission(
+    websocket: WebSocket, bsn: str, services, case_manager, mcp_connector, service_name, law_path=None, lang: str = "nl"
+):
+    """Handle submission of an application from the chat interface."""
+    try:
+        # Import the laws router for application submission
+        from web.routers.laws import evaluate_law
+
+        # Get the service details from the registry using the service name
+        service_obj = mcp_connector.registry.get_service(service_name)
+
+        if not service_obj:
+            error_msg = (
+                f"Service '{service_name}' not found in the system."
+                if lang == "en"
+                else f"Service '{service_name}' niet gevonden in het systeem."
+            )
+            html_message = format_message(error_msg)
+            await websocket.send_text(json.dumps({"message": error_msg, "html": str(html_message)}))
+            return True
+
+        # Extract service type and law path from the service object
+        service_type = service_obj.service_type
+        law = law_path or service_obj.law_path
+
+        # Get data needed for submission
+        law, result, parameters = evaluate_law(bsn, law, service_type, services, approved=False)
+        rule_spec = services.get_rule_spec(law, TODAY, service_type)
+
+        # Submit the case
+        case_manager.submit_case(
+            bsn=bsn,
+            service=service_type,
+            law=law,
+            parameters=parameters,
+            claimed_result=result.output,
+            approved_claims_only=False,
+        )
+
+        # Send confirmation message
+        # This will be the final message shown to the user, no additional LLM response needed
+        confirmation_msg = (
+            f"Your application for {rule_spec.get('name')} has been successfully submitted."
+            if lang == "en"
+            else f"Uw aanvraag voor {rule_spec.get('name')} is succesvol verzonden."
+        )
+        html_message = format_message(confirmation_msg)
+        await websocket.send_text(
+            json.dumps({"message": confirmation_msg, "html": str(html_message), "isSystemMessage": True})
+        )
+
+        return True
+
+    except Exception as e:
+        error_msg = (
+            f"An error occurred while submitting your application: {str(e)}"
+            if lang == "en"
+            else f"Er is een fout opgetreden bij het indienen van uw aanvraag: {str(e)}"
+        )
+        html_message = format_message(error_msg)
+        await websocket.send_text(
+            json.dumps({"message": error_msg, "html": str(html_message), "isSystemMessage": True})
+        )
+
+        print(f"Error submitting application: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
+
+        return True
+
+
+manager = ChatConnectionManager()
+
+
+@router.get("/", response_class=HTMLResponse)
+async def get_chat_page(
+    request: Request,
+    bsn: str = None,
+    llm: str = Query(None, description="LLM provider to use (claude or vlam)"),
+    services: EngineInterface = Depends(get_machine_service),
+):
+    """Render the chat interface page"""
+    if bsn is None:
+        bsn = get_demo_bsn()
+
+    # Check if chat feature is enabled
+    if not is_chat_enabled():
+        return templates.TemplateResponse(
+            "partials/feature_disabled.html", {"request": request, "feature_name": "Chat", "return_url": f"/?bsn={bsn}"}
+        )
+
+    try:
+        profile = services.get_profile_data(bsn)
+        if not profile:
+            return HTMLResponse("Profile not found", status_code=404)
+    except UnexpectedStatus as e:
+        error_message = e.content.decode("utf-8") if e.content else "No response content"
+        return HTMLResponse(f"Server error: {error_message}", status_code=500)
+
+    # Get available and configured LLM providers
+    available_providers = LLMFactory.get_available_providers()
+    configured_providers = LLMFactory.get_configured_providers(request)
+
+    # Determine which provider to use
+    current_provider = None
+
+    # First, check URL parameter
+    if llm and llm in configured_providers:
+        current_provider = llm
+        request.session["preferred_llm_provider"] = llm
+
+    # Then check session
+    elif (
+        "preferred_llm_provider" in request.session
+        and request.session["preferred_llm_provider"] in configured_providers
+    ):
+        current_provider = request.session["preferred_llm_provider"]
+
+    # Fall back to default
+    else:
+        current_provider = LLMFactory.get_provider(request)
+
+    return templates.TemplateResponse(
+        "chat.html",
+        {
+            "request": request,
+            "profile": profile,
+            "bsn": bsn,
+            "all_profiles": services.get_all_profiles(),
+            "llm_providers": available_providers,
+            "current_provider": current_provider,
+            "chat_enabled": is_chat_enabled(),
+            "wallet_enabled": is_chat_enabled(),
+        },
+    )
+
+
+@router.post("/set-provider")
+async def set_chat_provider(request: Request, provider: str = Form(...)):
+    """Set the preferred LLM provider in the session"""
+    configured_providers = LLMFactory.get_configured_providers(request)
+
+    if provider in configured_providers:
+        request.session["preferred_llm_provider"] = provider
+
+    # Redirect back to the chat page
+    return templates.TemplateResponse(
+        "partials/provider_updated.html",
+        {
+            "request": request,
+            "provider": provider,
+        },
+    )
+
+
+@router.get("/graph/{bsn}/{service_name}")
+async def get_decision_graph(
+    bsn: str,
+    service_name: str,
+    services: EngineInterface = Depends(get_machine_service),
+):
+    """Render and return the decision graph for a profile + service as a PNG image."""
+    import io
+
+    _scripts_dir = Path(__file__).parent.parent.parent / "analysis" / "llm_explanations" / "scripts"
+    if str(_scripts_dir) not in sys.path:
+        sys.path.insert(0, str(_scripts_dir))
+
+    try:
+        from extraction_generic import DecisionGraphExtractor, load_law_yaml, run_calculation  # noqa: E402
+    except ImportError as e:
+        return HTMLResponse(f"Graph dependencies not available: {e}", status_code=500)
+
+    try:
+        profile = services.get_profile_data(bsn)
+        if not profile:
+            return HTMLResponse("Profile not found", status_code=404)
+
+        law = load_law_yaml(service_name)
+        if not law:
+            return HTMLResponse(f"Law YAML for '{service_name}' not found", status_code=404)
+
+        calc_result = run_calculation(service_name, bsn, law, profile)
+        if not calc_result:
+            return HTMLResponse("Calculation failed", status_code=500)
+
+        extractor = DecisionGraphExtractor(law=law, profile=profile, bsn=bsn, calc_result=calc_result)
+        graph = extractor.extract()
+
+        buf = io.BytesIO()
+        person_name = profile.get("name", bsn)
+        law_name = law.get("name", service_name)
+        graph.visualize(output_path=buf, title=f"{law_name} — {person_name}")
+        buf.seek(0)
+        return Response(content=buf.read(), media_type="image/png")
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return HTMLResponse(f"Error generating graph: {e}", status_code=500)
+
+
+@router.websocket("/ws/{client_id}")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    client_id: str,
+    services: EngineInterface = Depends(get_machine_service),
+    case_manager: CaseManagerInterface = Depends(get_case_manager),
+    claim_manager: ClaimManagerInterface = Depends(get_claim_manager),
+):
+    # Check if chat feature is enabled — popup connections (client_id starts with "popup_") always allowed
+    if not is_chat_enabled() and not client_id.startswith("popup_"):
+        await websocket.accept()
+        await websocket.send_text(json.dumps({"error": "Chat feature is currently disabled", "feature_disabled": True}))
+        await websocket.close()
+        return
+    await manager.connect(websocket, client_id)
+
+    try:
+        # First receive connection data to get provider and BSN
+        data = await websocket.receive_text()
+        connection_data = json.loads(data)
+
+        # Get the BSN from the client_id or connection data
+        bsn = connection_data.get("bsn") or (client_id.split("_")[1] if "_" in client_id else get_demo_bsn())
+        # Get LLM provider from request or use default
+        selected_provider = connection_data.get("provider") or LLMFactory.get_provider()
+        # Guard can be disabled per-connection (e.g. for testing/comparison)
+        guard_enabled = not connection_data.get("no_guard", False)
+        # Graph mode: use knowledge graph as LLM context instead of raw service output
+        graph_enabled = connection_data.get("graph", False)
+        # Language preference for LLM responses
+        lang = connection_data.get("lang", "nl")
+
+        try:
+            profile = services.get_profile_data(bsn)
+
+            if not profile:
+                error_msg = f"Profile not found for BSN: {bsn}"
+                print(error_msg)
+                await websocket.send_text(json.dumps({"error": error_msg}))
+                manager.disconnect(client_id)
+                return
+        except UnexpectedStatus as e:
+            error_message = e.content.decode("utf-8") if e.content else "No response content"
+            error_msg = f"Server error getting profile for BSN {bsn}: {error_message}"
+            print(error_msg)
+            await websocket.send_text(json.dumps({"error": error_msg}))
+            manager.disconnect(client_id)
+            return
+
+        # services.set_profile_data(bsn) # TODO verify if this is necessary
+
+        # Check if selected provider is properly configured
+        if not LLMFactory.is_provider_configured(selected_provider):
+            error_msg = f"LLM provider {selected_provider} is not properly configured"
+            print(error_msg)
+            await websocket.send_text(json.dumps({"error": error_msg}))
+            manager.disconnect(client_id)
+            return
+
+        # Get appropriate LLM service using the factory
+        llm_service = LLMFactory.get_service(selected_provider)
+
+        # Send confirmation with provider info
+        await websocket.send_text(
+            json.dumps({"connected": True, "provider": selected_provider, "model": llm_service.model_id, "bsn": bsn})
+        )
+
+        mcp_connector = MCPLawConnector(services, case_manager, claim_manager)
+
+        # Cache the static service-tools section — never changes during a session
+        _cached_mcp_system_prompt = mcp_connector.get_system_prompt()
+
+        # Function to get fresh system prompt with up-to-date cases data
+        def get_updated_system_prompt():
+            cases_context = mcp_connector.get_cases_context(bsn)
+            return mcp_connector.jinja_env.get_template("chat_system_prompt.j2").render(
+                profile=profile,
+                bsn=bsn,
+                cases_context=cases_context,
+                mcp_system_prompt=_cached_mcp_system_prompt,
+                lang=lang,
+            )
+
+        # Initialize system prompt with initial data
+        system_prompt = get_updated_system_prompt()
+
+        # Initialize the conversation with just a list for user/assistant messages
+        messages = []
+
+        # If an initial assistant message is provided (e.g. from the explanation popup),
+        # seed the conversation so follow-up questions have context
+        initial_message = connection_data.get("initial_message")
+        if initial_message:
+            messages.append({"role": "assistant", "content": initial_message})
+
+        # Initialize variable to track service results
+        service_results = {}
+
+        while True:
+            # Receive message from WebSocket
+            data = await websocket.receive_text()
+            user_message = json.loads(data)
+
+            # Handle application submission
+            if user_message.get("submitApplication"):
+                service_name = user_message.get("service")
+                law = user_message.get("law")
+
+                if await handle_application_submission(
+                    websocket, bsn, services, case_manager, mcp_connector, service_name, law, lang=lang
+                ):
+                    continue
+
+            # Note: We previously had code here to check for "toon aanvraagformulier",
+            # but now we're using the LLM+tool approach instead, which is handled during service processing
+
+            # Regular message handling
+            user_msg_content = user_message.get("message", "")
+            messages.append({"role": "user", "content": user_msg_content})
+
+            # Get fresh system prompt with up-to-date claims data before each message
+            system_prompt = get_updated_system_prompt()
+
+            # Send message to get initial response using the LLM service
+            # Run in executor so slow local models (Ollama) don't block the event loop
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: llm_service.chat_completion(
+                    messages=messages,
+                    max_tokens=2000,
+                    system=system_prompt,
+                    temperature=0.7,
+                ),
+            )
+
+            # Extract the message text using the service's standard method
+            assistant_message = llm_service.get_completion_text(response)
+
+            # Check for value responses to previous questions about missing fields
+            # Format would be like "mijn inkomen is 35000 euro" or "mijn leeftijd is 42"
+            # Extract these as key-value pairs and create claims
+
+            # Simple pattern matching for common formats: "mijn X is Y" or "X: Y"
+            value_patterns = [
+                r"(?:mijn|mij|ik heb|ik ben|mijn|mijn|het)\s+([a-zéëïöüáóúA-Z\s_]+)\s+(?:is|zijn|bedraagt|heb|ben)\s+([0-9.,]+(?:\s*(?:euro|jaar|maanden|dagen|weken|personen|kinderen))?)",
+                r"([a-zéëïöüáóúA-Z\s_]+):\s*([0-9.,]+(?:\s*(?:euro|jaar|maanden|dagen|weken|personen|kinderen))?)",
+            ]
+
+            # Try to extract claims from user message
+            for pattern in value_patterns:
+                matches = re.findall(pattern, user_msg_content)
+                for match in matches:
+                    if len(match) == 2:
+                        key, value = match
+                        key = key.strip().lower().replace(" ", "_")
+
+                        # Clean up the value
+                        value_str = value.strip()
+                        parsed_value = value_str
+
+                        if "euro" in value_str:
+                            # Convert euro to cents
+                            value_str = value_str.replace("euro", "").strip()
+                            try:
+                                # Replace comma with dot for float parsing
+                                value_str = value_str.replace(",", ".")
+                                # Convert to cents (integer)
+                                parsed_value = int(float(value_str) * 100)
+                            except ValueError:
+                                # If conversion fails, keep as string
+                                parsed_value = value_str
+                        elif value_str.replace(".", "", 1).isdigit() or value_str.replace(",", "", 1).isdigit():
+                            # Convert to appropriate number type
+                            try:
+                                if "," in value_str:
+                                    value_str = value_str.replace(",", ".")
+                                parsed_value = float(value_str) if "." in value_str else int(value_str)
+                            except ValueError:
+                                parsed_value = value_str
+
+                        try:
+                            # Get services that might need this claim
+                            # If we're responding to a specific service request, use that service
+                            service_refs = mcp_connector.service_executor.extract_service_references(assistant_message)
+                            if service_refs:
+                                for service_name in service_refs:
+                                    service = mcp_connector.registry.get_service(service_name)
+                                    if service:
+                                        # Submit claim for this value
+                                        claim_manager.submit_claim(
+                                            service=service.service_type,
+                                            key=key,
+                                            new_value=parsed_value,
+                                            reason=f"Gebruiker gaf waarde door via chat: '{value_str}'",
+                                            claimant=f"CHAT_USER_{bsn}",
+                                            law=service.law_path,
+                                            bsn=bsn,
+                                            auto_approve=is_auto_approve_claims_enabled(),
+                                        )
+
+                                        # Update system prompt with new claim data
+                                        system_prompt = get_updated_system_prompt()
+                                        print(f"Created claim for {key}={parsed_value} for service {service_name}")
+                        except Exception as e:
+                            print(f"Error creating claim for {key}: {str(e)}")
+                            import traceback
+
+                            traceback.print_exc()
+
+            # Process Claude's message with MCP connector to extract and execute law services
+            service_results = mcp_connector.process_message(assistant_message, bsn)
+
+            # Get fresh system prompt with updated claims data
+            system_prompt = get_updated_system_prompt()
+
+            # If there are service results, add them to the context and generate a new response
+            final_message = assistant_message
+            rac_traces: dict = {}
+
+            # Store the application form reference for later
+            app_form_request = None
+            if "application_form" in service_results:
+                app_form_service = service_results["application_form"]["service"]
+                # Store the request for later, after the LLM responds
+                app_form_request = {
+                    "service": app_form_service,
+                    "results": {k: v for k, v in service_results.items() if k != "application_form"},
+                }
+
+                # Remove the application_form from service_results to avoid confusion
+                service_results.pop("application_form")
+
+            if service_results:
+                # Let the user know we're executing services
+                processing_msg = (
+                    "Working on the calculations... ⏳"
+                    if lang == "en"
+                    else "Ik ben even bezig met het uitvoeren van berekeningen... ⏳"
+                )
+                html_message = format_message(processing_msg)
+                await websocket.send_text(
+                    json.dumps({"message": processing_msg, "html": str(html_message), "isProcessing": True})
+                )
+
+                # Format the service results — use graph context in graph mode
+                if graph_enabled:
+                    graph_result = build_graph_context(
+                        service_results=service_results,
+                        services=services,
+                        registry=mcp_connector.registry,
+                        profile=profile,
+                        bsn=bsn,
+                        person_name=profile.get("name", bsn),
+                        reference_date=TODAY,
+                        return_traces=True,
+                    )
+                    service_context, rac_traces = graph_result if isinstance(graph_result, tuple) else (graph_result, {})
+                    service_context = service_context or mcp_connector.format_results_for_llm(service_results)
+
+                    # Send the decision graph as a visual panel to the chat
+                    graph_html = build_graph_html(
+                        service_results=service_results,
+                        services=services,
+                        registry=mcp_connector.registry,
+                        profile=profile,
+                        bsn=bsn,
+                        person_name=profile.get("name", bsn),
+                        reference_date=TODAY,
+                    )
+                    if graph_html:
+                        await websocket.send_text(json.dumps({"graphPanel": True, "html": graph_html}))
+                else:
+                    service_context = mcp_connector.format_results_for_llm(service_results)
+
+                # Create a temporary message from Claude that includes the tool call
+                tool_message = {"role": "assistant", "content": assistant_message}
+
+                # Check if there are missing required fields
+                missing_fields = []
+                for service_name, result in service_results.items():
+                    if isinstance(result.get("missing_fields"), list) and result.get("missing_fields"):
+                        missing_fields.extend([(service_name, field) for field in result.get("missing_fields")])
+
+                # Prepare content for the tool response using the template
+                content = mcp_connector.jinja_env.get_template("tool_response.j2").render(
+                    service_context=service_context, missing_fields=missing_fields if missing_fields else None
+                )
+
+                # Add service results as user message (representing tool output)
+                tool_response = {
+                    "role": "user",
+                    "content": content,
+                }
+
+                # Create a new conversation with the tool interaction
+                tool_conversation = messages.copy()
+                tool_conversation.append(tool_message)
+                tool_conversation.append(tool_response)
+
+                # Get latest claims data before generating the final response
+                system_prompt = get_updated_system_prompt()
+
+                # Get a new response with the tool results
+                final_response = await loop.run_in_executor(
+                    None,
+                    lambda: llm_service.chat_completion(
+                        messages=tool_conversation,
+                        max_tokens=2000,
+                        system=system_prompt,
+                        temperature=0.7,
+                    ),
+                )
+
+                # Get the final message with tool results incorporated
+                final_message = llm_service.get_completion_text(final_response)
+
+                # Update our conversation history
+                messages.append(tool_message)
+                messages.append(tool_response)
+
+            # Add the final message to the conversation history
+            messages.append({"role": "assistant", "content": final_message})
+
+            # Function to clean messages - extracted for reuse
+            def clean_message(message_text):
+                # Remove tool_use blocks
+                cleaned = re.sub(r"<tool_use>[\s\S]*?<\/tool_use>", "", message_text)
+                # Remove meta-instruction lines that small models sometimes output
+                # e.g. "Leg uit dat je de volgende stappen wilt uitvoeren:"
+                meta_patterns = [
+                    r"(?m)^Leg uit dat\b[^\n]*\n?",
+                    r"(?m)^Geef de burger\b[^\n]*\n?",
+                    r"(?m)^Als hij\b[^\n]*(?:zeg dan|antwoordt)[^\n]*\n?",
+                    r"(?m)^Als zij\b[^\n]*(?:zeg dan|antwoordt)[^\n]*\n?",
+                    r"(?m)^En voer de volgende stap uit[^\n]*\n?",
+                    r"(?m)^Voer de volgende stap uit[^\n]*\n?",
+                    r"(?m)^Bevestig dan dat[^\n]*\n?",
+                ]
+                for pattern in meta_patterns:
+                    cleaned = re.sub(pattern, "", cleaned)
+                # Remove any empty lines that might be left
+                cleaned = re.sub(r"\n\s*\n+", "\n\n", cleaned)
+                return cleaned.strip()
+
+            # Clean the message
+            cleaned_message = clean_message(final_message)
+
+            # Fix eurocent/euro formatting errors in LLM output (e.g. "21,12" → "2.112,00")
+            if service_results:
+                cleaned_message = mcp_connector.formatter.fix_amounts_in_text(cleaned_message, service_results)
+
+            # Guard: validate response is in-scope (Dutch government topics only)
+            # Run in executor so blocking HTTP call doesn't stall the event loop
+            if guard_enabled:
+                valid, guard_explanation = await asyncio.get_running_loop().run_in_executor(
+                    None, validate_response, user_msg_content, cleaned_message
+                )
+                if not valid:
+                    cleaned_message = REDIRECT_MESSAGE
+                    # Reset conversation history so a bad exchange doesn't poison future messages
+                    messages.clear()
+            else:
+                valid, guard_explanation = True, "guard disabled"
+
+            # Contestability score — on every assistant turn when graph mode is active
+            # rac_traces may be empty for follow-up turns (no service call); decisive_condition falls back to ""
+            c_score = None
+            if graph_enabled:
+                primary_trace = next(iter(rac_traces.values()), {}) if rac_traces else {}
+                c_score = contestability_score(cleaned_message, primary_trace)
+
+            # Server-side markdown rendering
+            html_message = format_message(cleaned_message)
+
+            # Send Claude's response back to the client with pre-rendered HTML
+            await websocket.send_text(json.dumps({
+                "message": cleaned_message,
+                "html": str(html_message),
+                "guard": {"valid": valid, "explanation": guard_explanation},
+                "contestability": c_score,
+            }))
+
+            # Now, if we have a pending application form request, display it AFTER the LLM response
+            if app_form_request:
+                # Give a small delay for better user experience
+                await asyncio.sleep(0.5)
+
+                # Display the application panel
+                await handle_application_display(
+                    websocket,
+                    bsn,
+                    services,
+                    case_manager,
+                    claim_manager,
+                    mcp_connector,
+                    app_form_request["results"],
+                    messages,
+                    f"Toon aanvraagformulier voor {app_form_request['service']}",
+                    templates,
+                    lang=lang,
+                )
+
+            # Helper function for recursive law chaining and claim processing
+            # We keep track of processed services to avoid duplicates in the same chain
+            processed_services = set()
+
+            async def process_next_step(current_message, current_messages):
+                """Process the next step in the chain recursively.
+
+                This handles both claim_value tools and service tools in a single recursive function.
+                For claims, it processes them and then re-executes the relevant service.
+                For service tools, it executes the requested service.
+                In both cases, it continues the recursion with the new response.
+                """
+                print("Processing next step in chain")
+
+                # Create fresh list of services to execute for this recursion level only
+                services_to_execute = []
+
+                # First check for claims - they take precedence
+                claim_refs = mcp_connector.claim_processor.extract_claims(current_message)
+                if claim_refs:
+                    print(f"Found {len(claim_refs)} claim references in message")
+                    claims_result = mcp_connector.claim_processor.process_claims(claim_refs, bsn)
+
+                    if claims_result and claims_result.get("submitted"):
+                        # Collect affected services for execution
+                        for claim in claims_result.get("submitted", []):
+                            service_name = claim.get("service")
+                            if service_name and service_name not in services_to_execute:
+                                services_to_execute.append(service_name)
+                                print(f"Adding service {service_name} to execution list due to claim")
+
+                # Then check for service references
+                service_refs = mcp_connector.service_executor.extract_service_references(current_message)
+                if service_refs:
+                    for service_name in service_refs:
+                        if service_name not in services_to_execute:
+                            services_to_execute.append(service_name)
+                            print(f"Adding service {service_name} to execution list due to tool call")
+
+                # If no services to execute, we're done with the recursion
+                if not services_to_execute:
+                    print("No services to execute, ending recursion")
+                    return
+
+                # Execute each service in order, but skip already processed ones in this chain
+                for service_name in services_to_execute:
+                    # Skip if we've already processed this service in this chain
+                    if service_name in processed_services:
+                        print(f"Skipping already processed service {service_name} in this chain")
+                        continue
+
+                    # Add to processed services set
+                    processed_services.add(service_name)
+
+                    service = mcp_connector.registry.get_service(service_name)
+                    if not service:
+                        print(f"Service {service_name} not found, skipping")
+                        continue
+
+                    # Let the user know we're executing this service
+                    processing_msg = (
+                        f"Checking your entitlement for {service_name}... ⏳"
+                        if lang == "en"
+                        else f"Ik ga nu kijken naar uw recht op {service_name}... ⏳"
+                    )
+                    html_message = format_message(processing_msg)
+                    await websocket.send_text(
+                        json.dumps({"message": processing_msg, "html": str(html_message), "isProcessing": True})
+                    )
+
+                    try:
+                        # Execute the service
+                        result = service.execute(bsn, {})
+                        service_results = {service_name: result}
+
+                        # Format the results
+                        service_context = mcp_connector.format_results_for_llm(service_results)
+
+                        # Create message prompt based on context
+                        is_from_claim = service_name in services_to_execute[: len(claim_refs)] if claim_refs else False
+
+                        if is_from_claim:
+                            content = mcp_connector.jinja_env.get_template("claim_processing.j2").render(
+                                service_name=service_name, service_context=service_context
+                            )
+                        else:
+                            content = mcp_connector.jinja_env.get_template("chained_service.j2").render(
+                                service_name=service_name, service_context=service_context
+                            )
+
+                        # Create a new conversation with these results
+                        next_conversation = current_messages.copy()
+                        next_conversation.append({"role": "user", "content": content})
+
+                        # Get a new response using the LLM service
+                        next_response = await loop.run_in_executor(
+                            None,
+                            lambda: llm_service.chat_completion(
+                                messages=next_conversation,
+                                max_tokens=2000,
+                                system=system_prompt,
+                                temperature=0.7,
+                            ),
+                        )
+
+                        # Get the response message
+                        next_message = llm_service.get_completion_text(next_response)
+
+                        # Update conversation history
+                        current_messages.append({"role": "user", "content": content})
+                        current_messages.append({"role": "assistant", "content": next_message})
+
+                        # Clean message before sending to client
+                        cleaned_next_message = clean_message(next_message)
+                        cleaned_next_message = mcp_connector.formatter.fix_amounts_in_text(
+                            cleaned_next_message, service_results
+                        )
+
+                        # Server-side markdown rendering
+                        html_message = format_message(cleaned_next_message)
+
+                        # Send response to client with pre-rendered HTML
+                        await websocket.send_text(
+                            json.dumps({"message": cleaned_next_message, "html": str(html_message)})
+                        )
+
+                        # Continue recursion with this new message
+                        await process_next_step(next_message, current_messages)
+
+                    except Exception as e:
+                        print(f"Error executing service {service_name}: {str(e)}")
+                        import traceback
+
+                        traceback.print_exc()
+
+            # Start recursive chaining process with the current message
+            await process_next_step(final_message, messages)
+
+    except WebSocketDisconnect:
+        print(f"WebSocket disconnected for client {client_id}")
+        manager.disconnect(client_id)
+    except Exception as e:
+        print(f"Error in websocket endpoint for client {client_id}: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
+        if client_id in manager.active_connections:
+            await websocket.send_text(json.dumps({"error": f"Server error: {str(e)}"}))
+        manager.disconnect(client_id)
